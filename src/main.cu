@@ -48,10 +48,13 @@ struct GemmConfigSm80 {
     // The layout of one tile of the smem block, will be tiled to fill the entire block.
     // The choice of this layout is important for performance.
     // Swizzling reduces shared memory bank conflicts.
-    using SmemLayoutAtom = decltype(ct::composition(ct::Swizzle<3, 3, 3>{},
-                                                    ct::Layout<
-                                                        ct::Shape<Int<SmemAtomOuter>, Int<SmemAtomInner>>,
-                                                        ct::Stride<Int<SmemAtomInner>, Int<1>>>{}));
+    // using SmemLayoutAtom = decltype(ct::composition(ct::Swizzle<3, 3, 3>{},
+    //                                                 ct::Layout<
+    //                                                     ct::Shape<Int<SmemAtomOuter>, Int<SmemAtomInner>>,
+    //                                                     ct::Stride<Int<SmemAtomInner>, Int<1>>>{}));
+    using SmemLayoutAtom = ct::Layout<
+        ct::Shape<Int<SmemAtomOuter>, Int<SmemAtomInner>>,
+        ct::Stride<Int<SmemAtomInner>, Int<1>>>;
 
    public:
     // Layout of each block of A/B in shared memory
@@ -106,7 +109,7 @@ __global__ void conv2d(
     int64_t N = ct::size<0>(img);
     int64_t H = ct::size<1>(img);
     int64_t W = ct::size<2>(img);
-    // int64_t C = img.shape(3);
+    int64_t C = ct::size<3>(img);
     // int64_t K = kernel.shape(0);
     int64_t R = ct::size<1>(kernel);
     int64_t S = ct::size<2>(kernel);
@@ -114,10 +117,6 @@ __global__ void conv2d(
 
     int64_t block_idx_m = blockIdx.x;
     int64_t block_idx_n = blockIdx.y;
-
-    auto img_grouped = ct::group_modes<0, 3>(img);  // ((N H W) C)
-    auto img_tile = ct::make_tile(ct::make_tile(Int<1>{}, Int<1>{}, Int<GemmConfig::BLK_M>{}), Int<GemmConfig::BLK_K>{});
-    auto img_blk = ct::local_tile(img_grouped, img_tile, ct::make_coord(block_idx_m, _));  // (BLK_M BLK_K N_BLK_K)
 
     auto kernel_grouped = ct::group_modes<1, 4>(kernel);  // (K (R S C))
     auto kernel_tile = ct::make_tile(Int<GemmConfig::BLK_N>{}, ct::make_tile(Int<1>{}, Int<1>{}, Int<GemmConfig::BLK_K>{}));
@@ -158,7 +157,7 @@ __global__ void conv2d(
 
     typename GemmConfig::GmemCopyA gmem_copy_A;
     auto thread_copy_A = gmem_copy_A.get_thread_slice(threadIdx.x);
-    auto id_A = ct::make_identity_tensor(ct::make_shape(ct::size<0>(img_blk), ct::size<1>(img_blk)));
+    auto id_A = ct::make_identity_tensor(ct::make_shape(Int<GemmConfig::BLK_M>{}, Int<GemmConfig::BLK_K>{}));
     auto src_id_A = thread_copy_A.partition_S(id_A);  // (COPY_V COPY_M COPY_K)
 
     for (int64_t r = -R / 2; r < R - R / 2; ++r) {
@@ -166,11 +165,12 @@ __global__ void conv2d(
             auto pred_A = ct::make_tensor<bool>(ct::select<1, 2>(src_id_A.shape()), ct::Stride<Int<1>, Int<0>>{});  // (COPY_M COPY_K)
             for (int64_t i = 0; i < ct::size<0>(pred_A); ++i) {
                 auto global_idx_m = block_idx_m * GemmConfig::BLK_M + ct::get<0>(src_id_A(0, i, 0));
-                auto coord_nhw = ct::idx2crd(global_idx_m, ct::shape<0>(img_grouped), ct::compact_row_major(ct::shape<0>(img_grouped)));
+                auto coord_nhw = ct::idx2crd(global_idx_m, ct::select<0, 1, 2>(img.shape()), ct::compact_row_major(ct::select<0, 1, 2>(img.shape())));
                 int64_t img_h = ct::get<1>(coord_nhw) + r;
                 int64_t img_w = ct::get<2>(coord_nhw) + s;
+                // pred_A(i, 0) = false;
                 pred_A(i, 0) = (0 <= img_h && img_h < H && 0 <= img_w && img_w < W);
-                if (ct::thread0()) {
+                if (ct::thread(0)) {
                     // ct::print("shape<0>(img_grouped):\n");
                     // ct::print(ct::shape<0>(img_grouped));
                     // ct::print("\n");
@@ -180,18 +180,31 @@ __global__ void conv2d(
                     ct::print("img_h: %d, img_w: %d, pred_A: %d\n", static_cast<int>(img_h), static_cast<int>(img_w), static_cast<int>(pred_A(i, 0)));
                 }
             }
-            if (ct::thread0()) {
+            if (ct::thread(0)) {
                 ct::print("\n");
             }
 
-            auto N_BLK_K = ct::size<2>(img_blk);
-            for (int64_t k = 0; k < N_BLK_K; ++k) {
-                auto src_A = thread_copy_A.partition_S(img_blk(_, _, k));  // (COPY_V COPY_M COPY_K)
+            for (int64_t k = 0; k < C / GemmConfig::BLK_K; ++k) {
+                auto img_grouped = ct::group_modes<0, 3>(ct::domain_offset(ct::make_coord(0, r, s, 0), img));  // ((N H W) C)
+                auto img_tile = ct::make_tile(ct::make_tile(Int<1>{}, Int<1>{}, Int<GemmConfig::BLK_M>{}), Int<GemmConfig::BLK_K>{});
+                auto img_blk = ct::local_tile(img_grouped, img_tile, ct::make_coord(block_idx_m, _));  // (BLK_M BLK_K N_BLK_K)
+                auto src_A = thread_copy_A.partition_S(img_blk(_, _, k));                              // (COPY_V COPY_M COPY_K)
                 auto dst_A = thread_copy_A.partition_D(sA);
+                if (ct::thread(0)) {
+                    ct::print("src_A\n");
+                    ct::print(src_A);
+                    ct::print("\n");
+                    ct::print("dst_A\n");
+                    ct::print(dst_A);
+                    ct::print("\n");
+                    ct::print("pred_A\n");
+                    ct::print(pred_A);
+                    ct::print("\n");
+                }
                 ct::copy_if(gmem_copy_A, pred_A, src_A, dst_A);
                 ct::cp_async_wait<0>();
                 __syncthreads();
-                if (ct::thread0()) {
+                if (ct::thread(0)) {
                     ct::print_tensor(sA);
                     ct::print("\n");
                 }
@@ -200,9 +213,9 @@ __global__ void conv2d(
     }
 
     if (ct::thread0()) {
-        ct::print("img_blk\n");
-        ct::print(img_blk);
-        ct::print("\n");
+        // ct::print("img_blk\n");
+        // ct::print(img_blk);
+        // ct::print("\n");
         // ct::print("src_A\n");
         // ct::print(src_A);
         // ct::print("\n");
@@ -215,7 +228,7 @@ __global__ void conv2d(
 void set_arange(ct::half_t *data, int64_t size) {
     std::vector<ct::half_t> host_data(size);
     for (int64_t i = 0; i < size; ++i) {
-        host_data[i] = static_cast<ct::half_t>(static_cast<float>(i) / 100);
+        host_data[i] = static_cast<ct::half_t>(static_cast<float>(i) / 10);
     }
     CUTE_CHECK_ERROR(cudaMemcpy(data, host_data.data(), size * sizeof(ct::half_t), cudaMemcpyHostToDevice));
 }
