@@ -18,7 +18,6 @@ function(compile name source_file)
         ${name} PRIVATE
         -Wno-unused-function
         --expt-relaxed-constexpr
-        -O3
     )
     target_include_directories(
         ${name} PRIVATE
@@ -28,3 +27,4 @@ function(compile name source_file)
 endfunction()
 
 compile(main src/main.cu)
+compile(test src/test.cu)
