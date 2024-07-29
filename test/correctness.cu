@@ -20,10 +20,10 @@ int main(int argc, char const *argv[]) {
     // int64_t M = atoi(argv[1]);
     // int64_t N = atoi(argv[2]);
     // int64_t K = atoi(argv[3]);
-    int64_t N = 1;
-    int64_t H = 16;
+    int64_t N = 8;
+    int64_t H = 32;
     int64_t W = 16;
-    int64_t C = 64;
+    int64_t C = 128;
     int64_t P = H;
     int64_t Q = W;
     int64_t K = 128;
@@ -106,10 +106,10 @@ int main(int argc, char const *argv[]) {
     std::cout << "Max abs err: " << max_abs_err << std::endl;
     std::cout << "Abs err prop: " << abs_err_prop * 100 << "%" << std::endl;
 
-    std::cout << "Output:" << std::endl
-              << output_tensor.host_view() << std::endl;
-    std::cout << "Output ref:" << std::endl
-              << output_ref_tensor.host_view() << std::endl;
+    // std::cout << "Output:" << std::endl
+    //           << output_tensor.host_view() << std::endl;
+    // std::cout << "Output ref:" << std::endl
+    //           << output_ref_tensor.host_view() << std::endl;
 
     return 0;
 }

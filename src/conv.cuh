@@ -10,7 +10,7 @@ using Gmem = ct::ViewEngine<ct::gmem_ptr<T *>>;
 template <typename T>
 using Smem = ct::ViewEngine<ct::smem_ptr<T *>>;
 
-#define DEBUG_THREAD ct::thread(0)
+#define DEBUG_THREAD ct::thread(0, 1)
 
 struct GemmConfigSm80 {
    public:
@@ -129,6 +129,10 @@ struct SmemGemm {
 
     // Write back result to gmem
     CUTE_DEVICE void write_back() {
+        // if (DEBUG_THREAD) {
+        //     ct::print_tensor(C_frag);
+        //     ct::print("\n");
+        // }
         auto C_frag_out = thread_mma.partition_C(C);  // Corresponding location in output tensor
         ct::copy(C_frag, C_frag_out);
     }
@@ -173,21 +177,32 @@ __global__ void conv2d_kernel(
     int64_t H = ct::size<1>(img);
     int64_t W = ct::size<2>(img);
     int64_t C = ct::size<3>(img);
+    int64_t K = ct::size<0>(kernel);
     int64_t R = ct::size<1>(kernel);
     int64_t S = ct::size<2>(kernel);
 
     auto [block_idx_m, block_idx_n] = threadblock_swizzle(group_size_m);
-    if (threadIdx.x == 0) {
-        ct::print("block_idx_m: %d, block_idx_n: %d\n", static_cast<int>(block_idx_m), static_cast<int>(block_idx_n));
-    }
+
+    // if (block_idx_m == 0) {
+    //     return;
+    // }
 
     // auto kernel_grouped = ct::group_modes<1, 4>(kernel);  // (K (R S C))
     auto kernel_tile = ct::make_tile(Int<GemmConfig::BLK_N>{}, Int<1>{}, Int<1>{}, Int<GemmConfig::BLK_K>{});
     auto kernel_blk = ct::local_tile(kernel, kernel_tile, ct::make_coord(block_idx_n, _, _, _));  // (BLK_N 1 1 BLK_K R S K_BLK_K)
 
-    auto out_grouped = ct::group_modes<0, 3>(out);  // ((N H W) K)
-    auto out_tile = ct::make_tile(ct::make_tile(Int<1>{}, Int<1>{}, Int<GemmConfig::BLK_M>{}), Int<GemmConfig::BLK_N>{});
+    // auto out_grouped = ct::group_modes<0, 3>(out);  // ((N H W) K)
+    auto out_grouped = ct::make_tensor(out.data(), ct::make_shape(N * H * W, K), ct::GenRowMajor{});
+    auto out_tile = ct::make_shape(Int<GemmConfig::BLK_M>{}, Int<GemmConfig::BLK_N>{});
     auto out_blk = ct::local_tile(out_grouped, out_tile, ct::make_coord(block_idx_m, block_idx_n));  // (BLK_M BLK_N)
+    // if (DEBUG_THREAD) {
+    //     ct::print("out_grouped\n");
+    //     ct::print(out_grouped);
+    //     ct::print("\n");
+    //     ct::print("out_blk\n");
+    //     ct::print(out_blk);
+    //     ct::print("\n");
+    // }
 
     // Allocate shared memory for the operands
     typename GemmConfig::SmemLayoutA smem_layout_A;
@@ -228,8 +243,10 @@ __global__ void conv2d_kernel(
             // }
 
             for (int64_t k = 0; k < C / GemmConfig::BLK_K; ++k) {
-                auto img_grouped = ct::group_modes<0, 3>(ct::domain_offset(ct::make_coord(0, r, s, 0), img));  // ((N H W) C)
-                auto img_tile = ct::make_tile(ct::make_tile(Int<1>{}, Int<1>{}, Int<GemmConfig::BLK_M>{}), Int<GemmConfig::BLK_K>{});
+                // auto img_grouped = ct::group_modes<0, 3>(ct::domain_offset(ct::make_coord(0, r, s, 0), img));  // ((N H W) C)
+                auto img_offset = ct::domain_offset(ct::make_coord(0, r, s, 0), img);
+                auto img_grouped = ct::make_tensor(img_offset.data(), ct::make_shape(N * H * W, C), ct::GenRowMajor{});
+                auto img_tile = ct::make_tile(Int<GemmConfig::BLK_M>{}, Int<GemmConfig::BLK_K>{});
                 auto img_blk = ct::local_tile(img_grouped, img_tile, ct::make_coord(block_idx_m, _));  // (BLK_M BLK_K N_BLK_K)
                 auto src_A = thread_copy_A.partition_S(img_blk(_, _, k));                              // (COPY_V COPY_M COPY_K)
                 auto dst_A = thread_copy_A.partition_D(sA);
@@ -260,7 +277,7 @@ __global__ void conv2d_kernel(
                 __syncthreads();
                 smem_gemm(sA, sB);
                 // if (DEBUG_THREAD) {
-                //     ct::print_tensor(sB);
+                //     ct::print_tensor(sA);
                 //     ct::print("\n");
                 // }
                 __syncthreads();
@@ -270,6 +287,7 @@ __global__ void conv2d_kernel(
 
     smem_gemm.write_back();
     ct::cp_async_wait<0>();
+    __syncthreads();
 }
 
 template <typename LayoutInput, typename LayoutKernel, typename LayoutOutput>
