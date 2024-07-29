@@ -23,8 +23,9 @@ function(compile name source_file)
         ${name} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/cutlass/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/cutlass/tools/util/include
     )
 endfunction()
 
 compile(main src/main.cu)
-compile(test src/test.cu)
+compile(correctness test/correctness.cu)
