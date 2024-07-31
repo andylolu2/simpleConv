@@ -10,7 +10,7 @@ using Gmem = ct::ViewEngine<ct::gmem_ptr<T *>>;
 template <typename T>
 using Smem = ct::ViewEngine<ct::smem_ptr<T *>>;
 
-#define DEBUG_THREAD ct::thread(0, 1)
+#define DEBUG_THREAD ct::thread(0, 0)
 
 struct GemmConfigSm80 {
    public:
@@ -171,7 +171,7 @@ template <typename GemmConfig, typename LayoutInput, typename LayoutKernel, type
 __global__ void conv2d_kernel(
     ct::Tensor<Gmem<ct::half_t>, LayoutInput> img,      // (N H W C)
     ct::Tensor<Gmem<ct::half_t>, LayoutKernel> kernel,  // (K R S C)
-    ct::Tensor<Gmem<ct::half_t>, LayoutOut> out,        // (N P=H Q=W K)
+    ct::Tensor<Gmem<ct::half_t>, LayoutOut> out,        // (N P Q K)
     int64_t group_size_m) {
     int64_t N = ct::size<0>(img);
     int64_t H = ct::size<1>(img);
@@ -180,19 +180,19 @@ __global__ void conv2d_kernel(
     int64_t K = ct::size<0>(kernel);
     int64_t R = ct::size<1>(kernel);
     int64_t S = ct::size<2>(kernel);
+    int64_t P = ct::size<1>(out);
+    int64_t Q = ct::size<2>(out);
+    int64_t pad_h = (P - (H - R + 1)) / 2;  // The front padding of H, (H - R + 1) is the natural output size if no padding is applied
+    int64_t pad_w = (Q - (W - S + 1)) / 2;  // The front padding of W, (W - S + 1) is the natural output size if no padding is applied
 
     auto [block_idx_m, block_idx_n] = threadblock_swizzle(group_size_m);
 
-    // if (block_idx_m == 0) {
-    //     return;
-    // }
-
     // auto kernel_grouped = ct::group_modes<1, 4>(kernel);  // (K (R S C))
     auto kernel_tile = ct::make_tile(Int<GemmConfig::BLK_N>{}, Int<1>{}, Int<1>{}, Int<GemmConfig::BLK_K>{});
-    auto kernel_blk = ct::local_tile(kernel, kernel_tile, ct::make_coord(block_idx_n, _, _, _));  // (BLK_N 1 1 BLK_K R S K_BLK_K)
+    auto kernel_blk_ = ct::local_tile(kernel, kernel_tile, ct::make_coord(block_idx_n, _, _, _));  // (BLK_N 1 1 BLK_K R S K_BLK_K)
+    auto kernel_blk = kernel_blk_(_, 0, 0, _, _, _, _);                                            // (BLK_N BLK_K R S K_BLK_K)
 
-    // auto out_grouped = ct::group_modes<0, 3>(out);  // ((N H W) K)
-    auto out_grouped = ct::make_tensor(out.data(), ct::make_shape(N * H * W, K), ct::GenRowMajor{});
+    auto out_grouped = ct::make_tensor(out.data(), ct::make_shape(N * P * Q, K), ct::GenRowMajor{});  // View the output tensor as ((N H W) K)
     auto out_tile = ct::make_shape(Int<GemmConfig::BLK_M>{}, Int<GemmConfig::BLK_N>{});
     auto out_blk = ct::local_tile(out_grouped, out_tile, ct::make_coord(block_idx_m, block_idx_n));  // (BLK_M BLK_N)
     // if (DEBUG_THREAD) {
@@ -215,19 +215,33 @@ __global__ void conv2d_kernel(
     SmemGemm<GemmConfig, std::decay_t<decltype(out_blk.layout())>> smem_gemm(out_blk);
 
     typename GemmConfig::GmemCopyA gmem_copy_A;
+    typename GemmConfig::GmemCopyB gmem_copy_B;
     auto thread_copy_A = gmem_copy_A.get_thread_slice(threadIdx.x);
     auto id_A = ct::make_identity_tensor(ct::make_shape(Int<GemmConfig::BLK_M>{}, Int<GemmConfig::BLK_K>{}));
-    auto src_id_A = thread_copy_A.partition_S(id_A);  // (COPY_V COPY_M COPY_K)
+    auto src_id_A = thread_copy_A.partition_S(id_A);                                                        // (COPY_V COPY_M COPY_K)
+    auto pred_A = ct::make_tensor<bool>(ct::select<1, 2>(src_id_A.shape()), ct::Stride<Int<1>, Int<0>>{});  // (COPY_M COPY_K)
 
     for (int64_t r = -R / 2; r < R - R / 2; ++r) {
         for (int64_t s = -S / 2; s < S - S / 2; ++s) {
-            auto pred_A = ct::make_tensor<bool>(ct::select<1, 2>(src_id_A.shape()), ct::Stride<Int<1>, Int<0>>{});  // (COPY_M COPY_K)
+            // Compute the mask for out-of-bound elements
             for (int64_t i = 0; i < ct::size<0>(pred_A); ++i) {
-                auto global_idx_m = C * (block_idx_m * GemmConfig::BLK_M + ct::get<0>(src_id_A(0, i, 0)));
-                auto coord_nhw = ct::idx2crd(global_idx_m, ct::select<0, 1, 2>(img.shape()), ct::select<0, 1, 2>(img.stride()));
-                int64_t img_h = ct::get<1>(coord_nhw) + r;
-                int64_t img_w = ct::get<2>(coord_nhw) + s;
-                pred_A(i, 0) = (0 <= img_h && img_h < H && 0 <= img_w && img_w < W);
+                // Flattend 1D index into the output tensor
+                auto out_idx = K * (block_idx_m * GemmConfig::BLK_M + ct::get<0>(src_id_A(0, i, 0)));
+
+                // Convert the 1D index into output coordinates (N P Q K). (We actually only need P and Q)
+                auto coord_npqk = out.get_flat_coord(out_idx);
+
+                // Convert p (q) to correpsonding h (w) in the input tensor
+                auto h_current = ct::get<1>(coord_npqk) + r + R / 2 - pad_h;
+                auto w_current = ct::get<2>(coord_npqk) + s + S / 2 - pad_w;
+
+                // Set the predicate to 1 if the input tensor is valid at the current coordinate
+                pred_A(i, 0) = (0 <= h_current && h_current < H && 0 <= w_current && w_current < W);
+
+                // auto coord_nhw = ct::idx2crd(global_idx_m, ct::select<0, 1, 2>(img.shape()), ct::select<0, 1, 2>(img.stride()));
+                // int64_t img_h = ct::get<1>(coord_nhw) + r;
+                // int64_t img_w = ct::get<2>(coord_nhw) + s;
+                // pred_A(i, 0) = (0 <= img_h && img_h < H && 0 <= img_w && img_w < W);
                 // if (DEBUG_THREAD) {
                 // ct::print("shape<0>(img_grouped):\n");
                 // ct::print(ct::shape<0>(img_grouped));
@@ -235,7 +249,9 @@ __global__ void conv2d_kernel(
                 // ct::print("stride<0>(img_grouped):\n");
                 // ct::print(ct::stride<0>(img_grouped));
                 // ct::print("\n");
-                // ct::print("img_h: %d, img_w: %d, pred_A: %d\n", static_cast<int>(img_h), static_cast<int>(img_w), static_cast<int>(pred_A(i, 0)));
+                // ct::print(coord_npqk);
+                // ct::print("\n");
+                // ct::print("img_h: %d, img_w: %d, pred_A: %d\n", static_cast<int>(h_current), static_cast<int>(w_current), static_cast<int>(pred_A(i, 0)));
                 // }
             }
             // if (DEBUG_THREAD) {
@@ -244,8 +260,10 @@ __global__ void conv2d_kernel(
 
             for (int64_t k = 0; k < C / GemmConfig::BLK_K; ++k) {
                 // auto img_grouped = ct::group_modes<0, 3>(ct::domain_offset(ct::make_coord(0, r, s, 0), img));  // ((N H W) C)
-                auto img_offset = ct::domain_offset(ct::make_coord(0, r, s, 0), img);
-                auto img_grouped = ct::make_tensor(img_offset.data(), ct::make_shape(N * H * W, C), ct::GenRowMajor{});
+
+                // Shift the input according to the current kernel offset r, s
+                auto img_offset = ct::domain_offset(ct::make_coord(0, r + R / 2 - pad_h, s + S / 2 - pad_w, 0), img);
+                auto img_grouped = ct::make_tensor(img_offset.data(), ct::make_shape(N * H * W, C), ct::GenRowMajor{});  // TODO: This can't be row major if padding is not "same"
                 auto img_tile = ct::make_tile(Int<GemmConfig::BLK_M>{}, Int<GemmConfig::BLK_K>{});
                 auto img_blk = ct::local_tile(img_grouped, img_tile, ct::make_coord(block_idx_m, _));  // (BLK_M BLK_K N_BLK_K)
                 auto src_A = thread_copy_A.partition_S(img_blk(_, _, k));                              // (COPY_V COPY_M COPY_K)
@@ -272,7 +290,7 @@ __global__ void conv2d_kernel(
                 //     ct::print("r: %d, s: %d, k: %d\n", static_cast<int>(r), static_cast<int>(s), static_cast<int>(k));
                 // }
                 ct::copy_if(gmem_copy_A, pred_A, src_A, dst_A);
-                load_block_from_gmem_to_smem(kernel_blk(_, 0, 0, _, r + R / 2, s + S / 2, k), sB, typename GemmConfig::GmemCopyB{});
+                load_block_from_gmem_to_smem(kernel_blk(_, _, r + R / 2, s + S / 2, k), sB, gmem_copy_B);
                 ct::cp_async_wait<0>();
                 __syncthreads();
                 smem_gemm(sA, sB);
@@ -287,7 +305,6 @@ __global__ void conv2d_kernel(
 
     smem_gemm.write_back();
     ct::cp_async_wait<0>();
-    __syncthreads();
 }
 
 template <typename LayoutInput, typename LayoutKernel, typename LayoutOutput>
@@ -295,18 +312,22 @@ void conv2d(
     const ct::Tensor<Gmem<ct::half_t>, LayoutInput> &input,
     const ct::Tensor<Gmem<ct::half_t>, LayoutKernel> &kernel,
     const ct::Tensor<Gmem<ct::half_t>, LayoutOutput> &output) {
-    int64_t N = ct::size<0>(input);
-    int64_t H = ct::size<1>(input);
-    int64_t W = ct::size<2>(input);
-    int64_t C = ct::size<3>(input);
-    int64_t K = ct::size<0>(kernel);
-    int64_t R = ct::size<1>(kernel);
-    int64_t S = ct::size<2>(kernel);
+    // int64_t N = ct::size<0>(input);
+    // int64_t H = ct::size<1>(input);
+    // int64_t W = ct::size<2>(input);
+    // int64_t C = ct::size<3>(input);
+    // int64_t K = ct::size<0>(kernel);
+    // int64_t R = ct::size<1>(kernel);
+    // int64_t S = ct::size<2>(kernel);
+    int64_t N = ct::size<0>(output);
+    int64_t P = ct::size<1>(output);
+    int64_t Q = ct::size<2>(output);
+    int64_t K = ct::size<3>(output);
 
-    assert((N * H * W) % GemmConfig::BLK_M == 0 && "N * H * W must be divisible by BLK_M");
+    assert((N * P * Q) % GemmConfig::BLK_M == 0 && "N * H * W must be divisible by BLK_M");
     assert(K % GemmConfig::BLK_N == 0 && "K must be divisible by BLK_N");
 
-    dim3 block_dim((N * H * W) / GemmConfig::BLK_M, K / GemmConfig::BLK_N);
+    dim3 block_dim((N * P * Q) / GemmConfig::BLK_M, K / GemmConfig::BLK_N);
     dim3 thread_dim(GemmConfig::NumThreads);
     int num_sms;
     CUTE_CHECK_ERROR(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0));

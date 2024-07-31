@@ -20,15 +20,23 @@ int main(int argc, char const *argv[]) {
     // int64_t M = atoi(argv[1]);
     // int64_t N = atoi(argv[2]);
     // int64_t K = atoi(argv[3]);
-    int64_t N = 8;
-    int64_t H = 32;
-    int64_t W = 16;
-    int64_t C = 128;
-    int64_t P = H;
-    int64_t Q = W;
+    int64_t N = 32;
+    int64_t H = 8;
+    int64_t W = 8;
+    int64_t C = 64;
     int64_t K = 128;
     int64_t R = 3;
     int64_t S = 3;
+    int64_t pad_h = 0;
+    int64_t pad_w = 0;
+    int64_t stride_h = 1;
+    int64_t stride_w = 1;
+    int64_t dilation_h = 1;
+    int64_t dilation_w = 1;
+    int64_t P = ((H + 2 * pad_h - R * dilation_h) / stride_h) + 1;
+    int64_t Q = ((W + 2 * pad_w - S * dilation_w) / stride_w) + 1;
+
+    std::cout << "N: " << N << ", H: " << H << ", W: " << W << ", C: " << C << ", K: " << K << ", R: " << R << ", S: " << S << ", P: " << P << ", Q: " << Q << std::endl;
 
     // Allocate A, B, C
     cutlass::HostTensor<ct::half_t, cutlass::layout::TensorNHWC> input_tensor({N, H, W, C});
@@ -49,7 +57,9 @@ int main(int argc, char const *argv[]) {
 
     // Reference
     cutlass::conv::Conv2dProblemSize problem_size(
-        N, H, W, C, P, Q, K, R, S, cutlass::conv::Mode::kCrossCorrelation);
+        N, H, W, C, K, R, S, P, Q,
+        pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w,
+        cutlass::conv::Mode::kCrossCorrelation);
 
     cutlass::reference::device::Conv2dFprop<
         cutlass::half_t,
@@ -106,10 +116,10 @@ int main(int argc, char const *argv[]) {
     std::cout << "Max abs err: " << max_abs_err << std::endl;
     std::cout << "Abs err prop: " << abs_err_prop * 100 << "%" << std::endl;
 
-    // std::cout << "Output:" << std::endl
-    //           << output_tensor.host_view() << std::endl;
-    // std::cout << "Output ref:" << std::endl
-    //           << output_ref_tensor.host_view() << std::endl;
+    std::cout << "Output:" << std::endl
+              << output_tensor.host_view() << std::endl;
+    std::cout << "Output ref:" << std::endl
+              << output_ref_tensor.host_view() << std::endl;
 
     return 0;
 }
